@@ -1,0 +1,26 @@
+# Databases (contain personal data)
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+
+# Output files (contain personal prompt data)
+clusters.html
+clusters.csv
+*.html
+ARC_REPORT.md
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
