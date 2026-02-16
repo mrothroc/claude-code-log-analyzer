@@ -6,14 +6,16 @@ This toolkit was developed during a 97-day research project analyzing 543 hours 
 
 ## What It Does
 
-Two complementary analyses:
+Three complementary analyses:
 
 1. **Arc Analysis** - Identifies coherent units of work ("arcs") from your prompts. What kind of work are you doing?
 2. **Agent Analysis** - Counts autonomous agent sessions and their durations. How much autonomous work happened?
+3. **Gate Analysis** - Discovers and analyzes review gate tools in your sessions. How effective are your quality gates?
 
 Tools:
 - **arc_analyzer.py** - Detects work arcs using semantic analysis (Gemini Flash Lite), counts agent session hours
 - **chat_analyzer.py** - Clusters prompts using Gemini embeddings + HDBSCAN to reveal interaction patterns
+- **gate_analyzer.py** - Discovers review gate tools, extracts gate check results, classifies decisions and error types
 
 ## Quick Start
 
@@ -43,6 +45,15 @@ python chat_analyzer.py extract
 python chat_analyzer.py embed
 python chat_analyzer.py cluster
 python chat_analyzer.py visualize
+
+# Analyze review gate effectiveness
+python gate_analyzer.py discover          # Find gate tools in your sessions
+python gate_analyzer.py extract           # Extract gate check results
+python gate_analyzer.py classify          # Classify decisions (regex + Gemini)
+python gate_analyzer.py classify-errors   # Classify error types on rejections
+python gate_analyzer.py stats             # Show gate statistics
+python gate_analyzer.py error-analysis    # Analyze rejection patterns
+python gate_analyzer.py report            # Generate markdown report
 ```
 
 ## Data Sources
@@ -51,6 +62,7 @@ The scripts read from your local Claude Code data directory (`~/.claude/`):
 
 | File | Content |
 |------|---------|
+| `history.jsonl` | User prompts with timestamps (used by chat_analyzer) |
 | `projects/*/` | Project session directories |
 | `projects/*/*.jsonl` | Full conversation transcripts |
 | `projects/*/agent-*.jsonl` | Subagent (autonomous) session logs |
@@ -69,7 +81,7 @@ python chat_analyzer.py extract --data-dir /path/to/claude-data
 If you have Claude Code data in multiple locations (e.g., different user accounts on the same machine), set:
 
 ```bash
-export CLAUDE_EXTRA_DIRS="/Users/other/.claude/projects:/shared/.claude/projects"
+export CLAUDE_EXTRA_DIRS="/home/other/.claude/projects:/shared/.claude/projects"
 ```
 
 ## Arc Analyzer
@@ -134,6 +146,69 @@ These patterns were specific to a delegation-heavy workflow with structured task
 | `config` | Configuration, setup, environment changes |
 | `other` | Anything that doesn't fit above categories |
 
+## Gate Analyzer
+
+Discovers review gate tools in your Claude Code sessions and analyzes their effectiveness. Works with any MCP-based review tool — no configuration required.
+
+```bash
+python gate_analyzer.py discover           # Auto-discover gate tools
+python gate_analyzer.py extract            # Extract gate check results
+python gate_analyzer.py classify           # Classify decisions (regex then Gemini)
+python gate_analyzer.py classify-errors    # Classify error types on rejections
+python gate_analyzer.py stats              # Show statistics
+python gate_analyzer.py error-analysis     # Analyze rejection patterns and recovery rates
+python gate_analyzer.py report             # Generate markdown report
+python gate_analyzer.py report -o out.md   # Write report to file
+```
+
+### How Gate Discovery Works
+
+**Automatic discovery** — the tool finds review gates using Gemini:
+
+1. **Scan** — Collects all `tool_use` names from JSONL files
+2. **Classify** — Sends tool names to Gemini Flash Lite (batched), asking which are quality review gates and what type they are
+3. **Cache** — Results stored in `gate_tools` table. Reuse on subsequent runs. `--rediscover` to refresh.
+
+Override with `--gates tool1,tool2` to skip discovery and specify gate tools manually.
+
+### Decision Classification
+
+Decisions are classified from gate tool responses:
+
+| Decision | Meaning |
+|----------|---------|
+| `APPROVED` | Work passed review |
+| `NEEDS_REVISION` | Work requires changes |
+| `ESCALATE` | Issue requires human attention |
+| `UNKNOWN` | Could not determine decision |
+
+Two-pass classification: regex patterns on response text first, then Gemini for remaining unknowns.
+
+### Error Type Classification
+
+Rejections are classified into error types using Gemini:
+
+| Type | Description |
+|------|-------------|
+| `SYSTEMATIC` | Wrong but internally consistent — misunderstood requirements, wrong architecture |
+| `INCOHERENT` | Internally inconsistent — contradicts own plan, random quality variation |
+| `OMISSION` | Simply left out — required component, test, or documentation skipped |
+| `API_ERROR` | Infrastructure failure, not a real rejection |
+
+### Options
+
+```bash
+--data-dir PATH      # Claude data directory (default: ~/.claude)
+--gates TOOLS        # Manual gate tool list (comma-separated, skips discovery)
+--model MODEL        # Gemini model (default: gemini-flash-lite-latest)
+--rediscover         # Re-run gate discovery
+--output FILE        # Write report to file (report command only)
+```
+
+### Related Research
+
+This tool was built to support the research in [AI Agents Aren't a Hot Mess](https://michael.roth.rocks/research/gate-analysis/) — an analysis of 4,918 cross-model review gate checks testing Anthropic's incoherence hypothesis.
+
 ## Chat Analyzer
 
 Clusters prompts using semantic embeddings to find patterns in how you interact with Claude Code.
@@ -164,6 +239,7 @@ python chat_analyzer.py embed --batch-size 50
 |------|-------------|
 | `arc_analytics.db` | SQLite database of arcs and agent sessions |
 | `chat_analytics.db` | SQLite database of prompts, sessions, tool calls |
+| `gate_analytics.db` | SQLite database of gate tools, checks, issues |
 | `clusters.html` | Interactive UMAP visualization |
 
 ## Requirements
@@ -173,6 +249,47 @@ python chat_analyzer.py embed --batch-size 50
 - Claude Code with existing conversation history
 
 ## Database Schema
+
+### gate_analytics.db
+
+```sql
+CREATE TABLE gate_tools (
+    tool_name TEXT PRIMARY KEY,
+    gate_type TEXT,           -- review_plan, review_design, review_code, codereview, precommit, validation, qa, audit
+    discovery_method TEXT     -- gemini, manual
+);
+
+CREATE TABLE gate_checks (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    project TEXT NOT NULL,
+    gate_type TEXT,
+    tool_name TEXT,
+    decision TEXT,            -- APPROVED, NEEDS_REVISION, ESCALATE, UNKNOWN
+    feedback_text TEXT,
+    feedback_length INTEGER,
+    error_class TEXT,         -- SYSTEMATIC, INCOHERENT, OMISSION, API_ERROR
+    timestamp TEXT,
+    session_file TEXT
+);
+
+CREATE TABLE gate_issues (
+    id INTEGER PRIMARY KEY,
+    gate_check_id INTEGER,
+    severity TEXT,
+    title TEXT,
+    description TEXT
+);
+
+CREATE TABLE gate_iterations (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT,
+    gate_type TEXT,
+    iteration_number INTEGER,
+    decision TEXT,
+    gate_check_id INTEGER
+);
+```
 
 ### arc_analytics.db
 
@@ -254,4 +371,5 @@ MIT License - See [LICENSE](LICENSE)
 ## Related
 
 - [543 Hours of Autonomous Work](https://michael.roth.rocks/research/543-hours/) - Research presentation using these tools
+- [AI Agents Aren't a Hot Mess](https://michael.roth.rocks/research/gate-analysis/) - Gate analysis research (4,918 cross-model review checks)
 - [Claude Code](https://github.com/anthropics/claude-code) - Anthropic's CLI for Claude

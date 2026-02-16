@@ -17,15 +17,16 @@ Usage:
     python arc_analyzer.py report      # Generate markdown report
 """
 
+import argparse
+import hashlib
 import json
+import os
 import re
 import sqlite3
-import os
-import hashlib
-from pathlib import Path
-from datetime import datetime
+import sys
 from collections import defaultdict
-import argparse
+from datetime import datetime
+from pathlib import Path
 from typing import Optional, Generator
 
 from tqdm import tqdm
@@ -36,7 +37,7 @@ PROJECTS_DIR = CLAUDE_DIR / "projects"
 DB_PATH = Path(__file__).parent / "arc_analytics.db"
 
 # Additional Claude directories to scan (set via --extra-dirs flag or environment variable)
-# Example: CLAUDE_EXTRA_DIRS=/Users/other/.claude/projects:/shared/.claude/projects
+# Example: CLAUDE_EXTRA_DIRS=/home/other/.claude/projects:/shared/.claude/projects
 ADDITIONAL_PROJECT_DIRS = [
     Path(p) for p in os.environ.get("CLAUDE_EXTRA_DIRS", "").split(":") if p
 ]
@@ -160,7 +161,7 @@ def stream_jsonl(file_path: Path) -> Generator[dict, None, None]:
                 except json.JSONDecodeError:
                     continue
     except Exception as e:
-        print(f"Error reading {file_path}: {e}")
+        print(f"Error reading {_sanitize_path(file_path)}: {e}")
 
 
 def extract_user_messages(session_file: Path) -> list[dict]:
@@ -251,7 +252,9 @@ def classify_boundaries_with_gemini(messages: list[dict], verbose: bool = False)
     # Initialize client
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
-        raise ValueError("Set GEMINI_API_KEY or GOOGLE_API_KEY environment variable")
+        print("Error: No Gemini API key found.")
+        print("Set GEMINI_API_KEY or GOOGLE_API_KEY environment variable.")
+        sys.exit(1)
 
     client = genai.Client(api_key=api_key)
 
@@ -416,7 +419,8 @@ def segment_into_arcs(messages: list[dict], assistant_data: dict,
         timestamp = msg['timestamp']
         content = msg['content']
 
-        if msg['is_topic_start']:
+        # First message always starts an arc, regardless of classification
+        if msg['is_topic_start'] or (i == 0 and current_arc is None):
             # Close previous arc - record next arc's start as boundary
             if current_arc:
                 current_arc['_next_arc_start'] = timestamp
@@ -536,10 +540,29 @@ def calculate_arc_metrics(arc: dict) -> dict:
     }
 
 
+def _sanitize_path(p) -> str:
+    """Replace home directory with ~ for display."""
+    return str(p).replace(str(Path.home()), '~')
+
+
+def _sanitize_project(project: str) -> str:
+    """Extract clean project name from Claude Code project identifiers.
+
+    Claude Code encodes local paths as project IDs (e.g. '-Users-alice-code-myapp').
+    Extract just the final component to avoid leaking filesystem structure.
+    """
+    if not project:
+        return ""
+    parts = [p for p in project.split("-") if p]
+    if len(parts) <= 1:
+        return project
+    return parts[-1]
+
+
 def extract_all_arcs(verbose: bool = True, limit_files: int = None):
     """Extract arcs from all project session files."""
     if verbose:
-        print(f"Initializing database at {DB_PATH}")
+        print(f"Initializing database at {_sanitize_path(DB_PATH)}")
     conn = init_db()
     cursor = conn.cursor()
 
@@ -556,7 +579,7 @@ def extract_all_arcs(verbose: bool = True, limit_files: int = None):
     for projects_dir in all_project_dirs:
         if not projects_dir.exists():
             if verbose:
-                print(f"Warning: {projects_dir} does not exist, skipping")
+                print(f"Warning: {_sanitize_path(projects_dir)} does not exist, skipping")
             continue
         for project_dir in projects_dir.iterdir():
             if not project_dir.is_dir():
@@ -787,6 +810,7 @@ def show_detail(arc_id: str, db_path: Path = DB_PATH):
 
     if not row:
         print(f"Arc {arc_id} not found.")
+        conn.close()
         return
 
     columns = [desc[0] for desc in cursor.description]
@@ -795,7 +819,7 @@ def show_detail(arc_id: str, db_path: Path = DB_PATH):
     print(f"\n=== Arc Detail: {arc_id} ===\n")
     print(f"Autonomy Level: {arc['autonomy_level']}")
     print(f"Intent: {arc['intent']}")
-    print(f"Project: {arc['project']}")
+    print(f"Project: {_sanitize_project(arc['project'])}")
     print(f"Start: {arc['start_time']}")
     print(f"End: {arc['end_time']}")
 
@@ -809,7 +833,7 @@ def show_detail(arc_id: str, db_path: Path = DB_PATH):
     print(f"Human interrupts: {arc['human_interrupts']}")
     print(f"Completion: {arc['completion_status']}")
     print(f"\nTrigger prompt:\n  {arc['trigger_prompt']}")
-    print(f"\nSession file: {arc['session_file']}")
+    print(f"\nSession file: {_sanitize_path(arc['session_file'])}")
 
     conn.close()
 
@@ -927,7 +951,7 @@ shifted to something different.
     with open(output, 'w') as f:
         f.write(report)
 
-    print(f"Report generated: {output}")
+    print(f"Report generated: {_sanitize_path(output)}")
 
 
 def extract_agent_session(agent_file: Path) -> Optional[dict]:
@@ -985,7 +1009,7 @@ def extract_agent_session(agent_file: Path) -> Optional[dict]:
 def extract_all_agents(verbose: bool = True, projects: list[str] = None):
     """Extract all agent sessions from project directories."""
     if verbose:
-        print(f"Initializing database at {DB_PATH}")
+        print(f"Initializing database at {_sanitize_path(DB_PATH)}")
     conn = init_db()
     cursor = conn.cursor()
 
@@ -998,7 +1022,7 @@ def extract_all_agents(verbose: bool = True, projects: list[str] = None):
     if PROJECTS_DIR.exists():
         all_project_dirs.append(PROJECTS_DIR)
     elif verbose:
-        print(f"Warning: {PROJECTS_DIR} does not exist")
+        print(f"Warning: {_sanitize_path(PROJECTS_DIR)} does not exist")
     all_project_dirs.extend([p for p in ADDITIONAL_PROJECT_DIRS if p.exists()])
 
     if not all_project_dirs:
@@ -1011,7 +1035,7 @@ def extract_all_agents(verbose: bool = True, projects: list[str] = None):
     agent_files = []
     for projects_dir in all_project_dirs:
         if verbose:
-            print(f"Scanning {projects_dir}")
+            print(f"Scanning {_sanitize_path(projects_dir)}")
         for project_dir in projects_dir.iterdir():
             if not project_dir.is_dir():
                 continue
@@ -1083,11 +1107,11 @@ def show_agent_stats():
     cursor.execute("""
         SELECT
             COUNT(*) as total,
-            SUM(duration_minutes) / 60.0 as total_hours,
-            AVG(duration_minutes) as avg_minutes,
-            MAX(duration_minutes) as max_minutes,
-            SUM(message_count) as total_messages,
-            SUM(tool_calls) as total_tools
+            COALESCE(SUM(duration_minutes) / 60.0, 0) as total_hours,
+            COALESCE(AVG(duration_minutes), 0) as avg_minutes,
+            COALESCE(MAX(duration_minutes), 0) as max_minutes,
+            COALESCE(SUM(message_count), 0) as total_messages,
+            COALESCE(SUM(tool_calls), 0) as total_tools
         FROM agent_sessions
         WHERE duration_minutes IS NOT NULL
     """)
@@ -1098,8 +1122,8 @@ def show_agent_stats():
     print(f"Total autonomous hours: {total_hours:.1f}")
     print(f"Average session duration: {avg_minutes:.1f} minutes")
     print(f"Longest session: {max_minutes:.1f} minutes ({max_minutes/60:.1f} hours)")
-    print(f"Total messages: {total_messages:,}")
-    print(f"Total tool calls: {total_tools:,}")
+    print(f"Total messages: {int(total_messages):,}")
+    print(f"Total tool calls: {int(total_tools):,}")
 
     # Duration distribution
     print("\n--- Duration Distribution ---")
@@ -1143,17 +1167,7 @@ def show_agent_stats():
     """)
 
     for project, sessions, hours in cursor.fetchall():
-        # Shorten project name for display (strip common path prefixes)
-        short_name = project
-        for prefix in ['-Users-', 'Users-']:
-            if prefix in short_name:
-                # Take everything after the last path-like segment
-                parts = short_name.split('-')
-                # Find where the actual project name starts (after IdeaProjects, Projects, etc.)
-                for i, part in enumerate(parts):
-                    if part in ('IdeaProjects', 'Projects', 'Shared'):
-                        short_name = '-'.join(parts[i+1:])
-                        break
+        short_name = _sanitize_project(project)
         print(f"{short_name[:48]:<50} {sessions:>10} {hours:>9.1f}h")
 
     # Longest sessions
@@ -1179,7 +1193,9 @@ def show_agent_stats():
     conn.close()
 
 
-if __name__ == "__main__":
+def main():
+    global CLAUDE_DIR, PROJECTS_DIR
+
     parser = argparse.ArgumentParser(description="Arc Analyzer - Analyze work arcs and agent sessions in Claude Code logs")
     parser.add_argument("command", choices=["extract", "agents", "stats", "list", "detail", "report"],
                         help="Command to run")
@@ -1215,3 +1231,14 @@ if __name__ == "__main__":
             show_detail(args.arc_id)
     elif args.command == "report":
         generate_report()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)

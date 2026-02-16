@@ -12,14 +12,15 @@ Usage:
     python chat_analyzer.py visualize  # Generate UMAP visualization
 """
 
+import argparse
 import json
+import os
 import sqlite3
 import struct
-import os
-from pathlib import Path
-from datetime import datetime
+import sys
 from collections import defaultdict
-import argparse
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -30,6 +31,21 @@ CLAUDE_DIR = Path.home() / ".claude"
 HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 DB_PATH = Path(__file__).parent / "chat_analytics.db"
+
+
+def _sanitize_path(p) -> str:
+    """Replace home directory with ~ for display."""
+    return str(p).replace(str(Path.home()), '~')
+
+
+def _sanitize_project(project: str) -> str:
+    """Extract clean project name from Claude Code project identifiers."""
+    if not project:
+        return ""
+    parts = [p for p in project.split("-") if p]
+    if len(parts) <= 1:
+        return project
+    return parts[-1]
 
 # Schema
 SCHEMA = """
@@ -85,7 +101,7 @@ def parse_history_jsonl(history_file: Path = HISTORY_FILE) -> list[dict]:
     """Parse history.jsonl and extract prompts."""
     prompts = []
     if not history_file.exists():
-        print(f"Warning: {history_file} does not exist")
+        print(f"Warning: {_sanitize_path(history_file)} does not exist")
         return prompts
     with open(history_file, 'r') as f:
         for line in f:
@@ -152,7 +168,7 @@ def extract_sessions_from_project(project_dir: Path) -> list[dict]:
                     except json.JSONDecodeError:
                         continue
         except Exception as e:
-            print(f"Error reading {jsonl_file}: {e}")
+            print(f"Error reading {_sanitize_path(jsonl_file)}: {e}")
             continue
 
         sessions.append({
@@ -220,7 +236,7 @@ def ingest_sessions(conn: sqlite3.Connection, sessions: list[dict]):
 def run_extraction(verbose: bool = True):
     """Run full extraction pipeline."""
     if verbose:
-        print(f"Initializing database at {DB_PATH}")
+        print(f"Initializing database at {_sanitize_path(DB_PATH)}")
     conn = init_db()
     cursor = conn.cursor()
 
@@ -232,7 +248,7 @@ def run_extraction(verbose: bool = True):
 
     # Extract prompts from history
     if verbose:
-        print(f"Parsing {HISTORY_FILE}...")
+        print(f"Parsing {_sanitize_path(HISTORY_FILE)}...")
     prompts = parse_history_jsonl()
     prompt_count = ingest_prompts(conn, prompts)
     if verbose:
@@ -240,11 +256,11 @@ def run_extraction(verbose: bool = True):
 
     # Extract sessions from each project
     if verbose:
-        print(f"Scanning {PROJECTS_DIR}...")
+        print(f"Scanning {_sanitize_path(PROJECTS_DIR)}...")
 
     total_sessions = 0
     if not PROJECTS_DIR.exists():
-        print(f"Warning: {PROJECTS_DIR} does not exist")
+        print(f"Warning: {_sanitize_path(PROJECTS_DIR)} does not exist")
         conn.close()
         return prompt_count, 0
 
@@ -254,7 +270,7 @@ def run_extraction(verbose: bool = True):
             count = ingest_sessions(conn, sessions)
             total_sessions += count
             if verbose and count > 0:
-                print(f"  {project_dir.name}: {count} sessions")
+                print(f"  {_sanitize_project(project_dir.name)}: {count} sessions")
 
     if verbose:
         print(f"Total: {total_sessions} sessions")
@@ -307,7 +323,7 @@ def show_stats(db_path: Path = DB_PATH):
     print("\nTop 10 projects by prompt count:")
     for row in cursor.fetchall():
         # Shorten project path for display
-        project = row[0].replace(str(Path.home()), '~')
+        project = _sanitize_project(row[0])
         print(f"  {project}: {row[1]}")
 
     # Time range
@@ -350,7 +366,9 @@ def generate_embeddings(db_path: Path = DB_PATH, batch_size: int = BATCH_SIZE):
     # Initialize client with API key from env
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
     if not api_key:
-        raise ValueError("Set GEMINI_API_KEY or GOOGLE_API_KEY environment variable")
+        print("Error: No Gemini API key found.")
+        print("Set GEMINI_API_KEY or GOOGLE_API_KEY environment variable.")
+        sys.exit(1)
     client = genai.Client(api_key=api_key)
 
     conn = sqlite3.connect(db_path)
@@ -548,7 +566,7 @@ def generate_visualization(db_path: Path = DB_PATH, output: str = "clusters.html
             title='Claude Code Prompt Clusters'
         )
         fig.write_html(output)
-        print(f"Visualization saved to {output}")
+        print(f"Visualization saved to {_sanitize_path(output)}")
 
     except ImportError:
         # Fallback: save coordinates to CSV
@@ -559,10 +577,12 @@ def generate_visualization(db_path: Path = DB_PATH, output: str = "clusters.html
             writer.writerow(['x', 'y', 'cluster', 'content'])
             for i, (x, y) in enumerate(embedding_2d):
                 writer.writerow([x, y, clusters[i], contents[i]])
-        print(f"Coordinates saved to {csv_output} (install plotly for HTML)")
+        print(f"Coordinates saved to {_sanitize_path(csv_output)} (install plotly for HTML)")
 
 
-if __name__ == "__main__":
+def main():
+    global CLAUDE_DIR, HISTORY_FILE, PROJECTS_DIR
+
     parser = argparse.ArgumentParser(description="Claude Code Chat Log Analyzer")
     parser.add_argument("command", choices=["extract", "embed", "cluster", "clusters", "stats", "visualize"],
                         help="Command to run")
@@ -597,3 +617,14 @@ if __name__ == "__main__":
         show_stats()
     elif args.command == "visualize":
         generate_visualization()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)

@@ -42,6 +42,29 @@ python chat_analyzer.py cluster    # Run HDBSCAN clustering
 python chat_analyzer.py visualize  # Generate UMAP visualization
 ```
 
+### gate_analyzer.py
+
+Discovers and analyzes review gate tools in Claude Code sessions. Measures gate effectiveness, classifies decisions, and categorizes error types.
+
+```bash
+python gate_analyzer.py discover         # Auto-discover gate tools via Gemini
+python gate_analyzer.py extract          # Extract gate checks from session JSONL
+python gate_analyzer.py classify         # Classify decisions (regex then Gemini)
+python gate_analyzer.py classify-errors  # Classify error types on rejections
+python gate_analyzer.py stats            # Show gate usage statistics
+python gate_analyzer.py error-analysis   # Analyze rejection patterns and recovery rates
+python gate_analyzer.py report           # Generate markdown report
+```
+
+**Pipeline:** `discover → extract → classify → classify-errors → stats/report`
+
+**Key design decisions:**
+- Zero-config gate discovery: sends all tool names to Gemini Flash Lite for classification
+- Generic JSON response parsing: tries common field names (`decision`, `status`, `code_review_status`, `workflow_guidance`), falls back to regex
+- Two-pass decision classification: regex patterns first (no API cost), Gemini for remaining unknowns
+- Error taxonomy: SYSTEMATIC (wrong approach), INCOHERENT (self-contradictory), OMISSION (incomplete)
+- Optional arc correlation: joins with `arc_analytics.db` if present, gracefully skips otherwise
+
 ## Technical Stack
 
 ### Python Dependencies
@@ -129,6 +152,31 @@ python chat_analyzer.py cluster --min-cluster-size 100
 3. **Tool call attribution**: Some tool calls lack session context
 4. **Project boundaries**: Cross-project work not fully captured
 5. **Embedding model choice**: Results may vary with different embedding models
+
+## Gate Analysis Phases
+
+### Phase 1: Gate Discovery
+1. Scan all JSONL files for unique `tool_use` names
+2. Send tool names to Gemini Flash Lite (batched in groups of 200), asking which are quality review gates and what type they are
+3. Cache discovered gates in `gate_tools` table with type and discovery method
+
+### Phase 2: Extraction
+1. For each JSONL file, find `tool_use` blocks matching discovered gate tools
+2. Match each `tool_use` to its `tool_result` via `tool_use_id`
+3. Parse JSON response trying common decision fields, fall back to regex on text
+4. Extract structured issues from feedback when available
+5. Compute iteration sequences (consecutive checks of same gate type in same session)
+
+### Phase 3: Classification
+1. **Regex pass** — Pattern-match decision keywords in feedback text (e.g., "approved", "needs revision", "rejected")
+2. **Gemini pass** — For remaining UNKNOWN decisions, send feedback text to Gemini for semantic classification
+3. **Error classification** — For NEEDS_REVISION decisions, classify error type as SYSTEMATIC, INCOHERENT, OMISSION, or API_ERROR
+
+### Phase 4: Analysis
+1. Compute approval rates, rejection rates, error type distributions
+2. Calculate recovery rates (what happens after rejection)
+3. Optionally correlate with arc data for complexity analysis
+4. Generate summary statistics and markdown reports
 
 ## Future Work
 
