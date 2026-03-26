@@ -51,6 +51,7 @@ python gate_analyzer.py discover          # Find gate tools in your sessions
 python gate_analyzer.py extract           # Extract gate check results
 python gate_analyzer.py classify          # Classify decisions (regex + Gemini)
 python gate_analyzer.py classify-errors   # Classify error types on rejections
+python gate_analyzer.py compute-overlap   # Compute overlap ratio (ω)
 python gate_analyzer.py stats             # Show gate statistics
 python gate_analyzer.py error-analysis    # Analyze rejection patterns
 python gate_analyzer.py report            # Generate markdown report
@@ -155,6 +156,7 @@ python gate_analyzer.py discover           # Auto-discover gate tools
 python gate_analyzer.py extract            # Extract gate check results
 python gate_analyzer.py classify           # Classify decisions (regex then Gemini)
 python gate_analyzer.py classify-errors    # Classify error types on rejections
+python gate_analyzer.py compute-overlap    # Compute overlap ratio (ω) across gates
 python gate_analyzer.py stats              # Show statistics
 python gate_analyzer.py error-analysis     # Analyze rejection patterns and recovery rates
 python gate_analyzer.py report             # Generate markdown report
@@ -195,6 +197,46 @@ Rejections are classified into error types using Gemini:
 | `OMISSION` | Simply left out — required component, test, or documentation skipped |
 | `API_ERROR` | Infrastructure failure, not a real rejection |
 
+### Overlap Ratio (ω)
+
+The overlap ratio measures whether your gates are doing independent work or catching the same problems. In a multi-stage pipeline, a task flows through stages (plan, design, code), producing different artifacts at each step. Each stage has its own review gate. A task can pass plan review but fail code review, or fail plan review, get revised, and then fail design review for a different reason.
+
+The overlap ratio asks: when two gates both rejected artifacts from the same task, were they catching the same problem or different ones?
+
+```bash
+python gate_analyzer.py compute-overlap
+```
+
+This computes:
+
+- **Global ω** — fraction of rejected sessions where artifacts were rejected by more than one gate type. ω = 0 means perfectly complementary (each gate catches unique errors). ω = 1 means perfectly redundant (every gate catches the same errors).
+- **Per-gate rejection rates** — which gates are doing the most filtering. A high rejection rate at an early stage means it's catching problems cheaply before they propagate.
+- **Pairwise ω** (Jaccard index) — overlap between each pair of gates. Shows exactly where redundancy exists.
+- **Error-class overlap** — when two gates reject the same session, do they flag the same error type (true redundancy) or different types (complementary)?
+
+**Getting your omega from zero:**
+
+```bash
+# 1. Find your gate tools (auto-discovers from your session logs)
+python gate_analyzer.py discover
+
+# 2. Extract gate check results from all sessions
+python gate_analyzer.py extract
+
+# 3. Classify each gate check as APPROVED / NEEDS_REVISION / ESCALATE
+python gate_analyzer.py classify
+
+# 4. (Optional) Classify error types on rejections — enables error-class overlap
+python gate_analyzer.py classify-errors
+
+# 5. Compute your overlap ratio
+python gate_analyzer.py compute-overlap
+```
+
+Steps 1-3 are required. Step 4 adds the error-class breakdown (which rejections are true redundancy vs complementary). The tool reads from `~/.claude/` by default — use `--data-dir` to point at a different location.
+
+For the full methodology and cross-domain validation, see [The Overlap Ratio: X-Raying Your AI Pipeline](https://michael.roth.rocks/research/overlap-ratio/).
+
 ### Options
 
 ```bash
@@ -207,7 +249,8 @@ Rejections are classified into error types using Gemini:
 
 ### Related Research
 
-This tool was built to support the research in [AI Agents Aren't a Hot Mess](https://michael.roth.rocks/research/gate-analysis/) — an analysis of 4,918 cross-model review gate checks testing Anthropic's incoherence hypothesis.
+- [The Overlap Ratio: X-Raying Your AI Pipeline](https://michael.roth.rocks/research/overlap-ratio/) — the overlap ratio metric, with data from software and medical imaging pipelines
+- [AI Agents Aren't a Hot Mess](https://michael.roth.rocks/research/gate-analysis/) — 4,918 cross-model review gate checks testing Anthropic's incoherence hypothesis
 
 ## Chat Analyzer
 
@@ -370,6 +413,7 @@ MIT License - See [LICENSE](LICENSE)
 
 ## Related
 
+- [The Overlap Ratio: X-Raying Your AI Pipeline](https://michael.roth.rocks/research/overlap-ratio/) - Measure whether your verification gates do independent work
 - [543 Hours of Autonomous Work](https://michael.roth.rocks/research/543-hours/) - Research presentation using these tools
 - [AI Agents Aren't a Hot Mess](https://michael.roth.rocks/research/gate-analysis/) - Gate analysis research (4,918 cross-model review checks)
 - [Claude Code](https://github.com/anthropics/claude-code) - Anthropic's CLI for Claude

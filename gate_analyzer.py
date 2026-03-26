@@ -10,6 +10,7 @@ Usage:
     python gate_analyzer.py extract            # Extract gate check usage from session logs
     python gate_analyzer.py classify           # Classify gate decisions and feedback
     python gate_analyzer.py classify-errors    # Classify error types in gate feedback
+    python gate_analyzer.py compute-overlap    # Compute overlap ratio (ω) across gates
     python gate_analyzer.py stats              # Show gate usage statistics
     python gate_analyzer.py error-analysis     # Analyze error patterns by gate type
     python gate_analyzer.py report             # Generate markdown report
@@ -2016,6 +2017,241 @@ def cmd_error_analysis(args):
     show_error_analysis()
 
 
+def show_overlap():
+    """Compute overlap ratio (omega) across review gates.
+
+    The overlap ratio measures how much different gates overlap in what they catch.
+    In a multi-stage pipeline, a task (identified by session_id) flows through stages,
+    producing artifacts that are checked by different gates. A task can be rejected by
+    plan review, revised, and then rejected again by code review for a different reason.
+
+    Omega asks: when two gates both rejected artifacts from the same task, were they
+    catching the same problem or different ones?
+
+    - Low omega (near 0) = gates catch different things (complementary, good)
+    - High omega (near 1) = gates catch the same things (redundant, wasteful)
+
+    Two levels of analysis:
+    - Session-level: did multiple gates reject artifacts from the same session?
+    - Error-class: when gates reject the same session, do they flag the same error type?
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    print("\n=== Overlap Analysis (ω) ===\n")
+
+    # Check we have data
+    cursor.execute("""
+        SELECT COUNT(DISTINCT session_id)
+        FROM gate_checks
+        WHERE decision = 'NEEDS_REVISION' AND session_id IS NOT NULL
+    """)
+    total_rejected = cursor.fetchone()[0]
+    if total_rejected == 0:
+        print("No rejected sessions found. Run 'extract' first.")
+        conn.close()
+        return
+
+    # --- Session-level overlap ---
+
+    # Global omega: fraction of rejected sessions rejected by >1 gate type
+    cursor.execute("""
+        WITH rejections AS (
+            SELECT DISTINCT session_id, gate_type
+            FROM gate_checks
+            WHERE decision = 'NEEDS_REVISION' AND session_id IS NOT NULL
+        ),
+        sessions_by_gate_count AS (
+            SELECT session_id, COUNT(DISTINCT gate_type) as gate_count
+            FROM rejections
+            GROUP BY session_id
+        )
+        SELECT
+            SUM(CASE WHEN gate_count > 1 THEN 1 ELSE 0 END) as multi_gate,
+            COUNT(*) as total
+        FROM sessions_by_gate_count
+    """)
+    multi_gate, total = cursor.fetchone()
+    global_omega = multi_gate / total if total > 0 else 0
+
+    print(f"--- Session-Level Overlap ---")
+    print(f"Global ω: {global_omega:.3f}")
+    print(f"  Sessions with artifacts rejected by multiple gates: {multi_gate} / {total}")
+
+    # Per-gate rejection counts
+    cursor.execute("""
+        SELECT gate_type, COUNT(DISTINCT session_id) as rejected
+        FROM gate_checks
+        WHERE decision = 'NEEDS_REVISION' AND session_id IS NOT NULL
+        GROUP BY gate_type
+        ORDER BY gate_type
+    """)
+    gate_rejection_counts = {row[0]: row[1] for row in cursor.fetchall()}
+    gate_types = sorted(gate_rejection_counts.keys())
+
+    if not gate_types:
+        print("No gate types found.")
+        conn.close()
+        return
+
+    # Per-gate rejection rates
+    print(f"\nPer-gate rejection rates:")
+    print(f"{'Gate':<30} {'Rejected':>10} {'Total':>10} {'Rate':>10}")
+    print("-" * 62)
+    for gt in gate_types:
+        cursor.execute("""
+            SELECT COUNT(DISTINCT session_id)
+            FROM gate_checks
+            WHERE gate_type = ? AND session_id IS NOT NULL
+        """, (gt,))
+        total_seen = cursor.fetchone()[0]
+        rejected = gate_rejection_counts[gt]
+        rate = rejected / total_seen if total_seen > 0 else 0
+        print(f"{gt:<30} {rejected:>10} {total_seen:>10} {rate:>9.1%}")
+
+    # Pairwise overlap (Jaccard: shared / union)
+    cursor.execute("""
+        WITH rejections AS (
+            SELECT DISTINCT session_id, gate_type
+            FROM gate_checks
+            WHERE decision = 'NEEDS_REVISION' AND session_id IS NOT NULL
+        )
+        SELECT a.gate_type, b.gate_type, COUNT(DISTINCT a.session_id) as shared
+        FROM rejections a
+        JOIN rejections b ON a.session_id = b.session_id AND a.gate_type < b.gate_type
+        GROUP BY a.gate_type, b.gate_type
+    """)
+    pairwise_shared = {}
+    for gate_a, gate_b, shared in cursor.fetchall():
+        pairwise_shared[(gate_a, gate_b)] = shared
+
+    if len(gate_types) > 1:
+        print(f"\nPairwise ω (Jaccard: shared / union):")
+        col_width = max(len(g) for g in gate_types) + 2
+        header = " " * col_width
+        for g in gate_types:
+            header += f"{g:>{col_width}}"
+        print(header)
+
+        for ga in gate_types:
+            row = f"{ga:<{col_width}}"
+            for gb in gate_types:
+                if ga == gb:
+                    row += f"{'-':>{col_width}}"
+                else:
+                    key = (min(ga, gb), max(ga, gb))
+                    shared = pairwise_shared.get(key, 0)
+                    union = gate_rejection_counts[ga] + gate_rejection_counts[gb] - shared
+                    omega = shared / union if union > 0 else 0
+                    row += f"{omega:>{col_width}.3f}"
+            print(row)
+
+        # Raw counts table
+        print(f"\nPairwise raw counts:")
+        print(f"{'Pair':<40} {'Shared':>8} {'Union':>8} {'ω':>8}")
+        print("-" * 66)
+        for i, ga in enumerate(gate_types):
+            for gb in gate_types[i + 1:]:
+                key = (min(ga, gb), max(ga, gb))
+                shared = pairwise_shared.get(key, 0)
+                union = gate_rejection_counts[ga] + gate_rejection_counts[gb] - shared
+                omega = shared / union if union > 0 else 0
+                pair_label = f"{ga} ↔ {gb}"
+                print(f"{pair_label:<40} {shared:>8} {union:>8} {omega:>7.3f}")
+
+    # --- Error-class overlap ---
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM gate_checks
+        WHERE decision = 'NEEDS_REVISION'
+          AND session_id IS NOT NULL
+          AND error_class IS NOT NULL
+          AND error_class != 'API_ERROR'
+    """)
+    classified_count = cursor.fetchone()[0]
+
+    if classified_count > 0 and len(gate_types) > 1:
+        print(f"\n--- Error Class Overlap ---")
+        print(f"(Using {classified_count} classified rejections)\n")
+
+        error_classes = ['OMISSION', 'SYSTEMATIC', 'INCOHERENT']
+
+        cursor.execute("""
+            SELECT gate_type, error_class, COUNT(DISTINCT session_id) as count
+            FROM gate_checks
+            WHERE decision = 'NEEDS_REVISION'
+              AND session_id IS NOT NULL
+              AND error_class IS NOT NULL
+              AND error_class != 'API_ERROR'
+            GROUP BY gate_type, error_class
+        """)
+        gate_error_counts = {}
+        for gate_type, error_class, count in cursor.fetchall():
+            gate_error_counts[(gate_type, error_class)] = count
+
+        cursor.execute("""
+            WITH classified AS (
+                SELECT DISTINCT session_id, gate_type, error_class
+                FROM gate_checks
+                WHERE decision = 'NEEDS_REVISION'
+                  AND session_id IS NOT NULL
+                  AND error_class IS NOT NULL
+                  AND error_class != 'API_ERROR'
+            )
+            SELECT a.gate_type, b.gate_type, a.error_class,
+                   COUNT(DISTINCT a.session_id) as shared_count
+            FROM classified a
+            JOIN classified b ON a.session_id = b.session_id
+                AND a.error_class = b.error_class
+                AND a.gate_type < b.gate_type
+            GROUP BY a.gate_type, b.gate_type, a.error_class
+        """)
+        shared_by_error = {}
+        for ga, gb, ec, count in cursor.fetchall():
+            shared_by_error[(ga, gb, ec)] = count
+
+        for i, ga in enumerate(gate_types):
+            for gb in gate_types[i + 1:]:
+                key = (min(ga, gb), max(ga, gb))
+                shared_total = pairwise_shared.get(key, 0)
+                if shared_total == 0:
+                    continue
+
+                print(f"  {ga} ↔ {gb}:")
+                print(f"    Same error class (true redundancy):")
+                any_same = False
+                for ec in error_classes:
+                    shared = shared_by_error.get((key[0], key[1], ec), 0)
+                    total_a = gate_error_counts.get((ga, ec), 0)
+                    total_b = gate_error_counts.get((gb, ec), 0)
+                    union = total_a + total_b - shared
+                    if shared > 0 or (total_a > 0 and total_b > 0):
+                        any_same = True
+                        print(f"      {ec:<14} {shared:>3} shared / {union:>3} total")
+                if not any_same:
+                    print(f"      (none)")
+                print()
+
+    # --- Interpretation ---
+    print("--- Interpretation ---")
+    if global_omega < 0.15:
+        print(f"  Global ω = {global_omega:.3f} → LOW overlap. Gates are largely complementary.")
+        print(f"  Each gate catches different problems. Minimal redundancy.")
+    elif global_omega < 0.35:
+        print(f"  Global ω = {global_omega:.3f} → MODERATE overlap. Some redundancy exists.")
+        print(f"  Gates share some catches but still provide distinct value.")
+    else:
+        print(f"  Global ω = {global_omega:.3f} → HIGH overlap. Significant redundancy.")
+        print(f"  Consider whether all gates are necessary or could be consolidated.")
+
+    conn.close()
+
+
+def cmd_compute_overlap(args):
+    """Compute overlap ratio across gates."""
+    show_overlap()
+
+
 def generate_report() -> str:
     """Generate markdown report with gate analysis summary.
 
@@ -2377,6 +2613,7 @@ Examples:
     subparsers.add_parser("classify-errors", help="Classify error types in gate feedback [R2]")
     subparsers.add_parser("stats", help="Show gate usage statistics")
     subparsers.add_parser("error-analysis", help="Analyze error patterns by gate type [R2]")
+    subparsers.add_parser("compute-overlap", help="Compute overlap ratio (ω) across gates")
 
     report_parser = subparsers.add_parser("report", help="Generate markdown report [R2]")
     report_parser.add_argument("--output", "-o", help="Write report to file instead of stdout")
@@ -2400,6 +2637,7 @@ Examples:
         "classify-errors": cmd_classify_errors,
         "stats": cmd_stats,
         "error-analysis": cmd_error_analysis,
+        "compute-overlap": cmd_compute_overlap,
         "report": cmd_report,
     }
 
