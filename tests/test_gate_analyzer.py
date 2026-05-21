@@ -13,6 +13,7 @@ from gate_analyzer import (
     _sanitize_project,
     parse_go_duration,
     parse_review_result,
+    _is_workflow_status_message,
 )
 
 
@@ -145,6 +146,46 @@ class TestParseReviewResult:
         assert result["decision"] == "APPROVED"
         assert result["feedback_text"] == "Looks good"
 
+    def test_two_phase_body_approval_overrides_stale_wrapper_rejection(self):
+        feedback = """# Design Review Analysis
+
+## Two-Phase Meta-Prompting Architecture
+
+**Decision**: NEEDS_REVISION
+
+## AI Analysis
+**DECISION:** APPROVED
+
+The design is approved without reservation.
+"""
+        data = {"decision": "NEEDS_REVISION", "feedback": feedback}
+        result = parse_review_result(json.dumps(data))
+        assert result["decision"] == "APPROVED"
+
+    def test_two_phase_body_rejection_stays_rejected(self):
+        feedback = """# Design Review Analysis
+
+## Two-Phase Meta-Prompting Architecture
+
+**Decision**: NEEDS_REVISION
+
+## AI Analysis
+**DECISION:** NEEDS_REVISION
+
+The design requires revision before implementation.
+"""
+        data = {"decision": "NEEDS_REVISION", "feedback": feedback}
+        result = parse_review_result(json.dumps(data))
+        assert result["decision"] == "NEEDS_REVISION"
+
+    def test_plain_rejection_approved_phrase_does_not_override_disposition(self):
+        text = """<disposition>NEEDS_REVISION</disposition>
+
+The proposed design requires revision before it can be approved for implementation.
+"""
+        result = parse_review_result(text)
+        assert result["decision"] == "NEEDS_REVISION"
+
     def test_direct_decision_canonicalized(self):
         data = {"decision": "PASSED", "feedback": "All checks pass"}
         result = parse_review_result(json.dumps(data))
@@ -204,3 +245,85 @@ class TestParseReviewResult:
         data = {"decision": "APPROVED", "execution_time": "2m30s"}
         result = parse_review_result(json.dumps(data))
         assert result["execution_time_seconds"] == pytest.approx(150.0)
+
+    def test_workflow_status_messages_parsed_as_status_only(self):
+        # 1. codereview row with status: "code_review_complete_ready_for_implementation" + next_step_required: false -> STATUS_ONLY
+        data1 = {"status": "code_review_complete_ready_for_implementation", "next_step_required": False}
+        result1 = parse_review_result(json.dumps(data1))
+        assert result1["decision"] == "STATUS_ONLY"
+
+        # 2. codereview row with next_step_required: true, no findings -> STATUS_ONLY
+        data2 = {"status": "code_review_complete_ready_for_implementation", "next_step_required": True}
+        result2 = parse_review_result(json.dumps(data2))
+        assert result2["decision"] == "STATUS_ONLY"
+
+    def test_real_verdict_with_findings_retains_classification(self):
+        # Real verdict + real issues_found -> classify correctly (no regression)
+        data = {
+            "status": "complete",
+            "decision": "APPROVED",
+            "issues_found": 0,
+            "feedback": "All looks great"
+        }
+        result = parse_review_result(json.dumps(data))
+        assert result["decision"] == "APPROVED"
+
+        data_fail = {
+            "status": "complete",
+            "decision": "NEEDS_REVISION",
+            "issues_found": 2,
+            "feedback": "Requires fixing unit tests"
+        }
+        result_fail = parse_review_result(json.dumps(data_fail))
+        assert result_fail["decision"] == "NEEDS_REVISION"
+
+
+# ── _is_workflow_status_message ──────────────────────────────────────────
+
+class TestIsWorkflowStatusMessage:
+    def test_valid_status_messages(self):
+        # 1. status: "code_review_complete_ready_for_implementation" + next_step_required: false
+        data1 = {"status": "code_review_complete_ready_for_implementation", "next_step_required": False}
+        assert _is_workflow_status_message(json.dumps(data1)) is True
+
+        # 2. status: "code_review_paused_needs_revision" + next_step_required: true (no findings or decision)
+        data2 = {"status": "code_review_paused_needs_revision", "next_step_required": True}
+        assert _is_workflow_status_message(json.dumps(data2)) is True
+
+        # 3. status matching continued with step_number
+        data3 = {"status": "code_review_continued", "step_number": 2}
+        assert _is_workflow_status_message(json.dumps(data3)) is True
+
+    def test_invalid_status_messages(self):
+        # Lacks step keys
+        data = {"status": "code_review_complete_ready_for_implementation"}
+        assert _is_workflow_status_message(json.dumps(data)) is False
+
+        # Non-matching status value
+        data = {"status": "unknown_status", "next_step_required": True}
+        assert _is_workflow_status_message(json.dumps(data)) is False
+
+        # Has explicit APPROVED verdict
+        data = {
+            "status": "code_review_complete_ready_for_implementation",
+            "next_step_required": False,
+            "decision": "APPROVED"
+        }
+        assert _is_workflow_status_message(json.dumps(data)) is False
+
+        # Has non-empty issues_found
+        data = {
+            "status": "code_review_complete_ready_for_implementation",
+            "next_step_required": True,
+            "issues_found": 3
+        }
+        assert _is_workflow_status_message(json.dumps(data)) is False
+
+        # Has non-empty findings list
+        data = {
+            "status": "code_review_complete_ready_for_implementation",
+            "next_step_required": True,
+            "findings": ["issue 1"]
+        }
+        assert _is_workflow_status_message(json.dumps(data)) is False
+

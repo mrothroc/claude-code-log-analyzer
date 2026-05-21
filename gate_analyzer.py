@@ -335,6 +335,128 @@ def _canonicalize_decision(raw: str) -> Optional[str]:
     return None  # Unrecognizable — let classify pipeline handle it
 
 
+def _is_workflow_status_message(feedback_text: str) -> bool:
+    """True if feedback_text is a pause/status/control message, not a substantive verdict.
+
+    Conjunctive heuristics:
+    - Parses as a JSON object (dict).
+    - Has a 'status' string matching /(_ready_for_|complete|paused|pending|continued)/i.
+    - Has 'next_step_required' or 'step_number'.
+    - Lacks non-empty 'issues_found', 'findings', or 'issues'.
+    - Lacks explicit 'decision', 'verdict', or '<disposition>' tag indicating APPROVED or NEEDS_REVISION.
+    """
+    if not feedback_text:
+        return False
+
+    try:
+        data = json.loads(feedback_text)
+    except (json.JSONDecodeError, TypeError):
+        return False
+
+    if not isinstance(data, dict):
+        return False
+
+    # Check status field
+    status_val = data.get("status")
+    if not isinstance(status_val, str):
+        return False
+    if not re.search(r'(_ready_for_|complete|paused|pending|continued)', status_val, re.IGNORECASE):
+        return False
+
+    # Check step keys
+    if "next_step_required" not in data and "step_number" not in data:
+        return False
+
+    # Lacks non-empty issues_found or findings
+    for key in ("issues_found", "findings", "issues"):
+        val = data.get(key)
+        if val:
+            if isinstance(val, (list, dict, str)) and len(val) > 0:
+                return False
+            if isinstance(val, int) and val > 0:
+                return False
+            if isinstance(val, bool) and val is True:
+                return False
+
+    # Lacks explicit verdict/decision/disposition
+    for key in ("decision", "verdict", "disposition"):
+        val = data.get(key)
+        if val and isinstance(val, str):
+            canonical = _canonicalize_decision(val)
+            if canonical in ("APPROVED", "NEEDS_REVISION"):
+                return False
+
+    if re.search(r'(?i)<disposition>\s*(APPROVED|NEEDS_REVISION)\s*</disposition>', feedback_text):
+        return False
+
+    return True
+
+
+def _extract_two_phase_body_decision(feedback_text: str) -> Optional[str]:
+    """Extract the actual body verdict from two-phase review-design feedback.
+
+    The two-phase review-design wrapper can contain a stale top-level
+    ``**Decision**: NEEDS_REVISION`` while the Phase 2 body under
+    ``## AI Analysis`` explicitly approves the design. In that format, the body
+    verdict is the substantive reviewer decision.
+    """
+    if not feedback_text:
+        return None
+
+    # Keep this intentionally narrow so generic "approved for implementation"
+    # wording in ordinary rejection text does not override a real rejection.
+    if not re.search(r'(?im)^\s*#\s+Design Review Analysis\s*$', feedback_text):
+        return None
+
+    ai_header = re.search(r'(?im)^\s*##\s+AI Analysis\s*$', feedback_text)
+    if not ai_header:
+        return None
+
+    body = feedback_text[ai_header.end():]
+
+    # If the body has an explicit DECISION line, the first one is authoritative.
+    decision_line = re.search(
+        r'(?im)^\s*(?:\*{0,2}\s*)?DECISION(?:\s*\*{0,2})?\s*:?'
+        r'(?:\s*\*{0,2})?\s*'
+        r'(APPROVED|PASS(?:ED)?|NEEDS[_ ]REVISION|REJECT(?:ED)?|FAIL(?:ED)?|ESCALATE)\b',
+        body,
+    )
+    if decision_line:
+        return _canonicalize_decision(decision_line.group(1))
+
+    # Some older review-design bodies have no DECISION line but still contain a
+    # clear approval conclusion. Only accept strong early-body approval language
+    # when no blocking/revision wording appears near the conclusion.
+    first_body = body[:2200]
+    first_body_lower = first_body.lower()
+    blocking_markers = (
+        "decision: needs_revision",
+        "needs revision",
+        "required revisions",
+        "requires revision",
+        "must be fixed",
+        "blocking issue",
+        "critical issue",
+    )
+    if any(marker in first_body_lower for marker in blocking_markers):
+        return None
+
+    approval_patterns = (
+        r'\bapproved\s+(?:to\s+move\s+to\s+the\s+next\s+stage|for\s+implementation|without\s+(?:reservation|revision))\b',
+        r'\b(?:proposal|design|plan)\s+is\s+approved\b',
+        r'\bit\s+is\s+approved\b',
+        r'\bthis\s+proposal\s+can\s+be\s+implemented\s+with\s+high\s+confidence\b',
+        r'\bthis\s+is\s+an\s+exemplary\s+design\s+document\b.{0,450}\b'
+        r'(?:thoroughly\s+addresses\s+all\s+criteria|meets\s+all\s+requirements|'
+        r'meticulously\s+addresses\s+all\s+official\s+acceptance\s+criteria|'
+        r'is\s+thorough|demonstrates\s+a\s+clear\s+understanding)\b',
+    )
+    if any(re.search(pattern, first_body, re.IGNORECASE | re.DOTALL) for pattern in approval_patterns):
+        return "APPROVED"
+
+    return None
+
+
 def parse_review_result(content_text: str) -> dict:
     """Parse a tool_result content text into structured gate check data.
 
@@ -359,12 +481,29 @@ def parse_review_result(content_text: str) -> dict:
     if not content_text:
         return result
 
+    if _is_workflow_status_message(content_text):
+        result["decision"] = "STATUS_ONLY"
+        result["feedback_text"] = content_text
+        try:
+            data = json.loads(content_text)
+            exec_time = data.get("execution_time")
+            if exec_time:
+                result["execution_time_seconds"] = parse_go_duration(exec_time)
+        except Exception:
+            pass
+        return result
+
     # Try to parse as JSON first
     try:
         data = json.loads(content_text)
     except (json.JSONDecodeError, TypeError):
         # Not JSON - treat whole content as feedback text
         result["feedback_text"] = content_text
+
+        body_decision = _extract_two_phase_body_decision(content_text)
+        if body_decision:
+            result["decision"] = body_decision
+            return result
 
         # Check for disposition tags in plain text
         disp_match = re.search(
@@ -392,6 +531,8 @@ def parse_review_result(content_text: str) -> dict:
         # Normalize to string — some tools return structured objects
         result["feedback_text"] = feedback if isinstance(feedback, str) else json.dumps(feedback, indent=2)
 
+    body_decision = _extract_two_phase_body_decision(result["feedback_text"])
+
     # Decision extraction - try patterns in order of specificity
 
     # Pattern 1: Direct decision field — canonicalize to enum values
@@ -399,9 +540,16 @@ def parse_review_result(content_text: str) -> dict:
     if raw_decision and isinstance(raw_decision, str):
         canonical = _canonicalize_decision(raw_decision)
         if canonical:
+            if canonical == "NEEDS_REVISION" and body_decision == "APPROVED":
+                result["decision"] = body_decision
+                return result
             result["decision"] = canonical
             return result
         # Unrecognized value — fall through to other patterns
+
+    if body_decision:
+        result["decision"] = body_decision
+        return result
 
     # Pattern 2: code_review_status (from codereview tools)
     code_review_status = data.get("code_review_status")
@@ -1242,8 +1390,15 @@ def classify_decisions_regex(verbose: bool = False) -> int:
     for row_id, current_decision, feedback_text in rows:
         new_decision = None
 
+        # First check if it is a workflow status message
+        if feedback_text and _is_workflow_status_message(feedback_text):
+            new_decision = "STATUS_ONLY"
+
         # Check feedback_text against regex patterns
-        if feedback_text:
+        if feedback_text and not new_decision:
+            new_decision = _extract_two_phase_body_decision(feedback_text)
+
+        if feedback_text and not new_decision:
             for pattern, decision_type in patterns:
                 if re.search(pattern, feedback_text):
                     new_decision = decision_type
@@ -1739,25 +1894,25 @@ def show_stats():
         print("  No error classifications found.")
         print("  Run 'classify-errors' to see error class breakdown.")
 
-    # Overall approval rate (excludes UNKNOWN from denominator)
+    # Overall approval rate (excludes UNKNOWN/STATUS_ONLY from denominator)
     print("\n--- Overall Approval Rate ---")
     cursor.execute("""
         SELECT
             SUM(CASE WHEN decision = 'APPROVED' THEN 1 ELSE 0 END) as approved,
             COUNT(*) as total,
-            SUM(CASE WHEN decision IS NULL OR decision = 'UNKNOWN' THEN 1 ELSE 0 END) as unknown
+            SUM(CASE WHEN decision IS NULL OR decision = 'UNKNOWN' OR decision = 'STATUS_ONLY' THEN 1 ELSE 0 END) as excluded
         FROM gate_checks
     """)
     row = cursor.fetchone()
     if row:
-        approved, total_checks, unknown = row
+        approved, total_checks, excluded = row
         approved = approved or 0
-        unknown = unknown or 0
-        known_total = total_checks - unknown
+        excluded = excluded or 0
+        known_total = total_checks - excluded
         if known_total > 0:
             approval_rate = (approved / known_total * 100)
             print(f"  Approved:     {approved} / {known_total} ({approval_rate:.1f}%)")
-            print(f"  (Excluded {unknown} UNKNOWN decisions from denominator)")
+            print(f"  (Excluded {excluded} UNKNOWN/STATUS_ONLY decisions from denominator)")
         else:
             print("  No classified decisions yet.")
 
@@ -2347,12 +2502,12 @@ def generate_report() -> str:
                 approved_count = count
 
         # Overall approval rate
-        # Exclude UNKNOWN from denominator (consistent with stats command)
-        unknown_count = sum(count for decision, count in decision_rows if decision == "UNKNOWN")
-        known_total = total_checks - unknown_count
+        # Exclude UNKNOWN and STATUS_ONLY from denominator (consistent with stats command)
+        excluded_count = sum(count for decision, count in decision_rows if decision in ("UNKNOWN", "STATUS_ONLY"))
+        known_total = total_checks - excluded_count
         approval_rate = (approved_count / known_total * 100) if known_total > 0 else 0
         lines.append("")
-        lines.append(f"**Overall Approval Rate:** {approval_rate:.1f}% (excluding {unknown_count} UNKNOWN)")
+        lines.append(f"**Overall Approval Rate:** {approval_rate:.1f}% (excluding {excluded_count} UNKNOWN/STATUS_ONLY)")
     else:
         lines.append("*No decision data available.*")
 
